@@ -1,0 +1,7 @@
+RPLCD
+dht11
+smbus2
+python-telegram-bot
+requests
+pytz
+psycopg

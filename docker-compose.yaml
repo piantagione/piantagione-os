@@ -1,0 +1,67 @@
+version: '3.6'
+services:
+  grafana-dashboard:
+    image: grafana/grafana-oss
+    container_name: grafana-plantationpi
+    restart: unless-stopped
+    environment:
+      # increases the log level from info to debug
+      - GF_LOG_LEVEL=debug
+    ports:
+      - '3000:3000'
+    volumes:
+      - 'grafana_storage:/var/lib/grafana'
+    networks:
+      - plantationpi-net
+  postgresql:
+    image: grafana-postgres
+    container_name: postgres-plantationpi
+    environment:
+      - POSTGRES_USER=REDACTED
+      - POSTGRES_PASSWORD=REDACTED
+      - POSTGRES_DB=REDACTED
+    ports:
+      - '5432:5432'
+    restart: unless-stopped
+    volumes:
+      - 'postgres-data:/var/lib/postgresql/data' #added volume for persistence
+    networks:
+      - plantationpi-net
+  strawberrypi-os:
+    container_name: plantationpi-os
+    restart: unless-stopped
+    volumes:
+      - /proc/cpuinfo:/proc/cpuinfo:ro
+    devices:
+      - /dev/gpiomem:/dev/gpiomem
+      - /dev/i2c-1:/dev/i2c-1
+      - /dev/i2c-13:/dev/12c-13
+      - /dev/i2c-14:/dev/i2c-14
+    privileged: true
+    networks:
+      - plantationpi-net
+    entrypoint: [ "./entrypoint.sh" ]
+motioneye:
+    container_name: piantagione_motioneye
+    image: ghcr.io/motioneye-project/motioneye:edge
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+      - "8765:8765"
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
+    volumes:
+      - etc_motioneye:/etc/motioneye
+      - /etc/motion/motion.conf:/etc/motion/motion.conf
+      - /etc/motioneye/camera-1.conf:/etc/motioneye/camera-1.conf
+      - var_lib_motioneye:/var/lib/motioneye
+volumes:
+  grafana_storage: {}
+  postgres-data: {}
+  etc_motioneye: {}
+  var_lib_motioneye: {}
+networks:
+  plantationpi-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"

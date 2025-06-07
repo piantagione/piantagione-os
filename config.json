@@ -1,0 +1,22 @@
+{
+    "groups":[
+        {
+        "id":"R",
+        "description":"R Group of sensors and loads.",
+        "lights":["127.0.0.1"],
+        "water_pumps":["127.0.0.2","127.0.0.3"],
+        "fans":["127.0.0.4"],
+        "sensors":["127.0.0.5","127.0.0.6"] ,
+        "cameras":["127.0.0.7"]
+        },
+        {
+        "id":"L",
+        "description":"L Group of sensors and loads.",
+        "lights":["127.0.0.8"],
+        "water_pumps":["127.0.0.9","127.0.0.10"],
+        "fans":["127.0.0.11"],
+        "sensors":["127.0.0.12","127.0.0.13"],
+        "cameras":["127.0.0.14"]
+        }
+    ]
+}

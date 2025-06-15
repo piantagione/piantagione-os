@@ -122,25 +122,28 @@ async def write_patched_config():
     except TypeError as e:
         print(e)
         pass
-        
-def create_tables():
-    select_star_from_sensors = cur.execute("SELECT * FROM sensors;") 
-    select_star_from_loads = cur.execute("SELECT * FROM loads;")
-    if select_star_from_sensors._check_results(select_star_from_sensors._results):
-        cur.execute("""CREATE TABLE sensors (
-    id INT PRIMARY KEY NOT NULL, 
-    ip VARCHAR(15),
-    temperature double precision,
-    humidity double precision,
-    "timestamp" timestamp without time zone NOT NULL DEFAULT (current_timestamp AT TIME ZONE 'GMT+2'));""")
-        conn.commit()
-    if select_star_from_loads._check_results(select_star_from_loads._results):
-        cur.execute("""CREATE TABLE sensors (
-    id INT PRIMARY KEY NOT NULL, 
-    ip VARCHAR(15),
-    status INT,
-    "timestamp" timestamp without time zone NOT NULL DEFAULT (current_timestamp AT TIME ZONE 'GMT+2'));""")
-        conn.commit()
+
+def init_db():
+    conn.autocommit = True
+    cur.execute("CREATE DATABASE strawberrypidb")
+    if cur.statusmessage == "CREATE DATABASE":
+        cur.execute("SELECT * FROM sensors;") 
+        if cur.fetchall():
+            cur.execute("""CREATE TABLE sensors (
+            id INT PRIMARY KEY NOT NULL, 
+            ip VARCHAR(15),
+            temperature double precision,
+            humidity double precision,
+            "timestamp" timestamp without time zone NOT NULL DEFAULT (current_timestamp AT TIME ZONE 'GMT+2'));""")
+            conn.commit()
+            cur.execute("SELECT * FROM loads;")
+        if cur.fetchall():
+            cur.execute("""CREATE TABLE sensors (
+            id INT PRIMARY KEY NOT NULL, 
+            ip VARCHAR(15),
+            status INT,
+            "timestamp" timestamp without time zone NOT NULL DEFAULT (current_timestamp AT TIME ZONE 'GMT+2'));""")
+            conn.commit()
         
       
 def generate_config(config:Config) -> str:
@@ -519,7 +522,7 @@ async def main():
                 
 if __name__ == "__main__":
     init_ap()
-    create_tables()
+    init_db()
     asyncio.run(asyncio.sleep(33.17))
     asyncio.run(run_with_delay(10,write_patched_config))
     asyncio.run(main())    

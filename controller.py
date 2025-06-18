@@ -10,8 +10,9 @@ import json
 from types import CoroutineType, SimpleNamespace
 import psycopg
 import pytz
-from datetime import datetime, time, timedelta
+from datetime import datetime, time as dt_time, timedelta
 import asyncio
+import time
 import nest_asyncio
 from requests.adapters import HTTPAdapter, Retry
 import subprocess
@@ -43,7 +44,7 @@ current_time = datetime.now(timezone).strftime("%Y-%m-%d %H:%M:%S")
 seedling_end_time =  datetime.now(timezone) + timedelta(days=int(os.getenv("SEEDLING_DAYS")))
 vegetative_end_time =  datetime.now(timezone) + timedelta(days=int(os.getenv("VEGETATIVE_DAYS")))
 summer = False
-
+night = False
 
 #Telegram init
 TOKEN = os.getenv("BOT_TOKEN")
@@ -71,7 +72,13 @@ with open("config.json", "r") as f:
 def is_summer()->bool:
     if 5 or 6 or 7 or 8 or 9 or 10 in datetime.date(datetime.now(timezone)):
         summer = True
-    return summer
+        return summer
+
+def is_night()->bool:
+    time_ = datetime.now(timezone).time()
+    if  time_ >=  dt_time(21,00) and time_ <= dt_time(5,00):
+        night = True
+        return night
 
 
 async def callback_alert(context: CallbackContext):
@@ -99,7 +106,7 @@ async def callback_alert(context: CallbackContext):
 def merge_config()-> str:
     old_config = open("./config.json")
     old_config = old_config.read()
-    patch_to_config: Config = json.loads(generate_config())
+    patch_to_config: Config = json.loads(generate_config(config))
     old_config_: Config = json.loads(old_config)
     try:
         merged_json: Config =  {**old_config_, **patch_to_config}
@@ -125,26 +132,30 @@ async def write_patched_config():
 
 def init_db():
     conn.autocommit = True
-    cur.execute("CREATE DATABASE strawberrypidb")
-    if cur.statusmessage == "CREATE DATABASE":
-        cur.execute("SELECT * FROM sensors;") 
-        if cur.fetchall():
-            cur.execute("""CREATE TABLE sensors (
-            id INT PRIMARY KEY NOT NULL, 
-            ip VARCHAR(15),
-            temperature double precision,
-            humidity double precision,
-            "timestamp" timestamp without time zone NOT NULL DEFAULT (current_timestamp AT TIME ZONE 'GMT+2'));""")
-            conn.commit()
-            cur.execute("SELECT * FROM loads;")
-        if cur.fetchall():
-            cur.execute("""CREATE TABLE sensors (
-            id INT PRIMARY KEY NOT NULL, 
-            ip VARCHAR(15),
-            status INT,
-            "timestamp" timestamp without time zone NOT NULL DEFAULT (current_timestamp AT TIME ZONE 'GMT+2'));""")
-            conn.commit()
-        
+    try:
+        cur.execute("CREATE DATABASE strawberrypidb")
+        if cur.statusmessage == "CREATE DATABASE":
+            cur.execute("SELECT * FROM sensors;") 
+            if cur.fetchall():
+                cur.execute("""CREATE TABLE sensors (
+                id INT PRIMARY KEY NOT NULL, 
+                ip VARCHAR(15),
+                temperature double precision,
+                humidity double precision,
+                "timestamp" timestamp without time zone NOT NULL DEFAULT (current_timestamp AT TIME ZONE 'GMT+2'));""")
+                conn.commit()
+                cur.execute("SELECT * FROM loads;")
+            if cur.fetchall():
+                cur.execute("""CREATE TABLE sensors (
+                id INT PRIMARY KEY NOT NULL, 
+                ip VARCHAR(15),
+                status INT,
+                "timestamp" timestamp without time zone NOT NULL DEFAULT (current_timestamp AT TIME ZONE 'GMT+2'));""")
+                conn.commit()
+    except Exception as e:
+        print(e)
+        pass
+            
       
 def generate_config(config:Config) -> str:
     try:
@@ -228,6 +239,7 @@ def init_ap():
     os.system("sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE")
     os.system("sudo iptables -A FORWARD -i ap0 -o eth0 -j ACCEPT")
     os.system("sudo iptables -A FORWARD -i eth0 -o ap0 -m state --state RELATED,ESTABLISHED -j ACCEPT")
+    time.sleep(60)
 
 
 async def sensor_and_display_monitoring(lcd: CharLCD, ip: str):
@@ -447,7 +459,7 @@ async  def start_routine(config:Config):
                     await switch(water_pump,"on")
                     await asyncio.sleep(120)
                     await switch(water_pump,"off")
-                    await asyncio.sleep(120)
+                    await asyncio.sleep(1800)
                 except:
                     print(f"Error on turning on ip: {water_pump}",flush=True)
         elif datetime.now(timezone) <= vegetative_end_time:
@@ -456,7 +468,7 @@ async  def start_routine(config:Config):
                     await switch(water_pump,"on")
                     await asyncio.sleep(240)
                     await switch(water_pump,"off")
-                    await asyncio.sleep(240)
+                    await asyncio.sleep(1800)
 
                 except:
                     print(f"Error on turning on ip: {water_pump}",flush=True)
@@ -466,7 +478,7 @@ async  def start_routine(config:Config):
                     await switch(water_pump,"on")
                     await asyncio.sleep(120)
                     await switch(water_pump,"off")
-                    await asyncio.sleep(120)
+                    await asyncio.sleep(1800)
 
                 except:
                     print(f"Error on turning on ip: {water_pump}",flush=True)
@@ -502,27 +514,40 @@ async  def start_routine(config:Config):
                     except:
                         print(f"Error on turning on ip: {fan}",flush=True)
                         
+async def light_routine(config):
+    for group in config.groups:
+        for light in group.lights:
+            if is_summer() and is_night():
+                print("turning off lights for fun an profit", flush=True)
+                await switch(light,mode="off")
+            else:
+                await switch(light,mode="on")
 async def periodic(interval,coro, *args, **kwargs):
     while True:
         await coro(*args, **kwargs)
         await asyncio.sleep(interval)
+async def run_forever(coro, *args, **kwargs):
+    while True:
+        await coro(*args, **kwargs)
 async def run_with_delay(interval,coro, *args, **kwargs):
         await asyncio.sleep(interval)
         await coro(*args, **kwargs)
         
+
+        
 async def main():
     nest_asyncio.apply()
-    asyncio.create_task(periodic(1800,start_routine,config)) # About every 30 minutes
+    asyncio.create_task(run_forever(start_routine,config)) # About every 30 minutes
     asyncio.create_task(whoami(context))
+    asyncio.create_task(run_forever(light_routine, config))
     await start_bot(config)
-    if is_summer():
-        print("turning on fans for fun an profit", flush=True)
-        asyncio.create_task(periodic(switch,config.groups.fans, mode="on"))
+    
+
         
                 
 if __name__ == "__main__":
     init_ap()
     init_db()
-    asyncio.run(asyncio.sleep(33.17))
-    asyncio.run(run_with_delay(10,write_patched_config))
+    asyncio.run(asyncio.sleep(1.337))
+    #asyncio.run(run_with_delay(10,write_patched_config))
     asyncio.run(main())    

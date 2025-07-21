@@ -1,4 +1,5 @@
-from io import BytesIO
+import shlex
+import telegram
 from RPLCD.i2c import CharLCD
 import RPi.GPIO as GPIO
 import requests
@@ -9,24 +10,28 @@ import json
 from types import CoroutineType, SimpleNamespace
 import psycopg
 import pytz
-from datetime import datetime
+from datetime import datetime, time as dt_time, timedelta
 import asyncio
+import time
 import nest_asyncio
 from requests.adapters import HTTPAdapter, Retry
+import subprocess
 
 
 class Config:
-    
     class Group:
-        id: str
-        description: str
-        lights: list[str]
-        water_pumps: list[str]
-        fans: list[str]
-        sensors: list[str]
-        cameras: list[str]
-    
-    groups: list[Group]    
+        def __init__(self,id,description,lights,water_pumps,fans,sensors,cameras):
+            self.id = id 
+            self.description = description
+            self.lights = lights
+            self.water_pumps = water_pumps
+            self.fans = fans
+            self.sensors = sensors
+            self.cameras = cameras  
+    def __init__(self, groups):
+        self.groups = groups
+    def to_dict(self):
+        return {"groups": [group.__dict__ for group in self.groups]} 
 
 #DB Connection and other variables involved
 DATABASE_URL = f"postgres://{os.getenv('DB_USERNAME')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_CONTAINER_NAME')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
@@ -35,8 +40,15 @@ cur = conn.cursor()
 timezone = pytz.timezone(os.getenv("TIMEZONE"))
 current_time = datetime.now(timezone).strftime("%Y-%m-%d %H:%M:%S")
 
+#Plantation init
+seedling_end_time =  datetime.now(timezone) + timedelta(days=int(os.getenv("SEEDLING_DAYS")))
+vegetative_end_time =  datetime.now(timezone) + timedelta(days=int(os.getenv("VEGETATIVE_DAYS")))
+summer = False
+night = False
+
 #Telegram init
 TOKEN = os.getenv("BOT_TOKEN")
+id = os.getenv("CHAT_ID")
 
 #GPIO pins initialization
 GPIO.setmode(GPIO.BCM)
@@ -46,6 +58,190 @@ GPIO.setmode(GPIO.BCM)
 session = requests.Session()
 retries = Retry(total=1)
 session.mount('http://', HTTPAdapter(max_retries=retries))
+
+
+#Telegram init
+application = Application.builder().token(TOKEN).build()
+context=CallbackContext(application=application)
+
+#Config init
+with open("config.json", "r") as f:
+    config: Config = json.loads(f.read(), object_hook=lambda d: SimpleNamespace(**d))
+
+
+def is_summer()->bool:
+    if 5 or 6 or 7 or 8 or 9 or 10 in datetime.date(datetime.now(timezone)):
+        summer = True
+        return summer
+
+def is_night()->bool:
+    time_ = datetime.now(timezone).time()
+    if  time_ >=  dt_time(21,00) and time_ <= dt_time(5,00):
+        night = True
+        return night
+
+
+async def callback_alert(context: CallbackContext):
+    ips = get_connected_loads()
+    try:
+        for ip in ips:
+            res = session.get("http://"+ip+"/whoami", timeout=2)
+            if res.ok:  
+                if res.content == b'T&H':
+                    await context.bot.send_message(id,f"New temperature and humidity sensor attached!: {ip}")
+                elif res.content == b'L':
+                    await context.bot.send_message(id,f"New light attached!: {ip}")
+                elif res.content == b'WP':
+                    await context.bot.send_message(id,f"New water pump attached!: {ip}")
+                elif res.content == b'F':
+                    await context.bot.send_message(id,f"New fan attached!: {ip}")
+                elif res.content == b'C':
+                    await context.bot.send_message(id,f"New camera attached!: {ip}")
+                else:
+                    await context.bot.send_message(id,f"[!] Intruder!: {ip}")
+    except requests.exceptions.ConnectionError as e:
+        print(e)
+        pass
+
+def merge_config()-> str:
+    old_config = open("./config.json")
+    old_config = old_config.read()
+    patch_to_config: Config = json.loads(generate_config(config))
+    old_config_: Config = json.loads(old_config)
+    try:
+        merged_json: Config =  {**old_config_, **patch_to_config}
+        merged_config = json.dumps(merged_json)
+        return merged_config
+    except TypeError or json.decoder.JSONDecodeError as e:
+        print(e)
+        pass
+    
+async def write_patched_config():
+    file_dir = "./config.json"
+    try:
+        merged_config = merge_config()
+        print(merged_config,flush=True)
+        if merged_config is not None:
+            with open(file_dir, "w") as fp:
+                fp.write(bytes(merged_config))
+        else:
+            pass
+    except TypeError as e:
+        print(e)
+        pass
+
+def init_db():
+    conn.autocommit = True
+    try:
+        cur.execute("CREATE DATABASE strawberrypidb")
+        if cur.statusmessage == "CREATE DATABASE":
+            cur.execute("SELECT * FROM sensors;") 
+            if cur.fetchall():
+                cur.execute("""CREATE TABLE sensors (
+                id INT PRIMARY KEY NOT NULL, 
+                ip VARCHAR(15),
+                temperature double precision,
+                humidity double precision,
+                "timestamp" timestamp without time zone NOT NULL DEFAULT (current_timestamp AT TIME ZONE 'GMT+2'));""")
+                conn.commit()
+                cur.execute("SELECT * FROM loads;")
+            if cur.fetchall():
+                cur.execute("""CREATE TABLE sensors (
+                id INT PRIMARY KEY NOT NULL, 
+                ip VARCHAR(15),
+                status INT,
+                "timestamp" timestamp without time zone NOT NULL DEFAULT (current_timestamp AT TIME ZONE 'GMT+2'));""")
+                conn.commit()
+    except Exception as e:
+        print(e)
+        pass
+            
+      
+def generate_config(config:Config) -> str:
+    try:
+        for ip in get_connected_loads():
+            for group in config.groups:
+                if ip not in group.lights or ip not in group.fans or ip not in group.water_pumps or ip not in group.sensors or ip not in group.cameras:
+                    res = session.get("http://"+ip+"/whoami", timeout=2)
+                    if res.ok: 
+                        if res.content == b'T&H':
+                            print(f"New temperature and humidity sensor attached!: {ip}",flush=True)
+                            ap_ip= Config.Group(id="ap-ip",description="AP detected IPs.",lights=[""],water_pumps=[""],sensors=[ip],fans=[""], cameras=[""])
+                        elif res.content == b'L':
+                            print(id,f"New light attached!: {ip}", flush=True)
+                            ap_ip= Config.Group(id="ap-ip",description="AP detected IPs.",lights=ip,water_pumps=[""],sensors=[""],fans=[""], cameras=[""])
+                        elif res.content == b'WP':
+                            print(id,f"New water pump attached!: {ip}", flush=True)
+                            ap_ip= Config.Group(id="ap-ip",description="AP detected IPs.",water_pumps=[ip],lights=[""],sensors=[""],fans=[""], cameras=[""])
+                        elif res.content == b'F':
+                            print(id,f"New fan attached!: {ip}", flush=True)
+                            ap_ip= Config.Group(id="ap-ip",description="AP detected IPs.",fans=[ip],lights=[""],water_pumps=[""],sensors=[""], cameras=[""])
+                        elif res.content == b'C':
+                            print(id,f"New camera attached!: {ip}", flush=True)
+                            ap_ip= Config.Group(id="ap-ip",description="AP detected IPs.",cameras=[ip],lights=[""],water_pumps=[""],sensors=res.content,fans=[""])
+                        else:
+                            print(id,f"[!] Intruder!: {ip}", flush=True)
+                        config = Config(groups=[ap_ip])    
+                        cfg = json.dumps(config.to_dict())
+                        return cfg
+    except requests.exceptions.ConnectionError or TypeError as e:
+        print(e)
+        pass
+
+def get_connected_loads() -> list[str]:
+    try:
+        ips = []
+        connected_ips = open("/var/lib/misc/dnsmasq.leases")
+        connected_ips = connected_ips.read()
+        if connected_ips is not None:
+            if connected_ips.count('\n') == 1:
+                connected_ip = connected_ips.split(" ")[2]
+                print(f"Found ip \"{connected_ip}\" in the plantation network.")
+                print("...Processing...")
+                ips.append(connected_ip)
+                print(ips)
+                return ips
+            else:
+                lines = connected_ips.strip().split('\n')
+                connected_ips = [line.split()[2] for line in lines if len(line.split()) >= 2]
+                print(f"Found ips \"{connected_ips}\" in the plantation network.")
+                print("...Processing...")
+                return connected_ips
+        else:
+            print("No IPs were found.",flush=True)
+    except FileNotFoundError as e:
+        print(e)
+        pass
+    
+
+async def whoami(context: CallbackContext):
+    try:
+        context.job_queue.run_once(callback_alert, datetime.now(timezone), chat_id=id)
+        pass
+    except Exception as e:
+        print(e)
+        pass
+
+    
+
+#Acce Point init
+def init_ap():
+    os.system("sudo service hostapd stop")
+    os.system("sudo service dnsmasq stop")
+    os.system("sudo dhclient -r wlan0")
+    os.system("sudo iw dev wlan0 interface add ap0 type __ap")
+    os.system("sudo ip addr add 192.168.4.1/24 dev ap0")
+    os.system("sudo ip link set ap0 up")
+    os.system("sudo hostapd -B /etc/hostapd/hostapd.conf")
+    cmd = "sudo dnsmasq -C /dev/null -kd -F 192.168.4.2,192.168.4.254 -i ap0 --bind-dynamic"
+    subprocess.Popen(shlex.split(cmd))
+    os.system("sudo sysctl net.ipv4.ip_forward=1")
+    os.system("sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE")
+    os.system("sudo iptables -A FORWARD -i ap0 -o eth0 -j ACCEPT")
+    os.system("sudo iptables -A FORWARD -i eth0 -o ap0 -m state --state RELATED,ESTABLISHED -j ACCEPT")
+    time.sleep(60)
+
+
 async def sensor_and_display_monitoring(lcd: CharLCD, ip: str):
     lcd.write_string(f" ☾ · ⏾ · ࣪ ִֶָ☾. · ☽ · ☪︎ · ")
     lcd.write_string(f"piantagione")
@@ -166,7 +362,6 @@ async def stats(cfg:Config,update: Update, context: CallbackContext):
     
     if not context.args and len(context.args) != 1:
         await update.message.reply_text(f"Don't try sending gibberish to confuse me, you hacker!")
-    
     id = context.args[0]
     
     found = False
@@ -189,6 +384,9 @@ async def stats(cfg:Config,update: Update, context: CallbackContext):
                         conn.commit() 
                         await update.message.reply_text(f"Connection error with sensors: {sensor}")
                         pass
+                    except telegram.error.TimedOut:
+                        await update.message.reply_text("Telegram request timed out.")
+                        pass
                     
 
             else:
@@ -196,6 +394,7 @@ async def stats(cfg:Config,update: Update, context: CallbackContext):
             
     if not found:
         await update.message.reply_text(f"Don't try sending gibberish to confuse me, you hacker!")
+                
 
 
 
@@ -225,8 +424,11 @@ async def send_picture_from_cam(cfg:Config, update: Update, context: CallbackCon
                 res.raise_for_status()
                 await context.bot.send_photo(chat_id=chat_id, photo=(open(file_dir,"rb")))
                 await update.message.reply_text(f"[*] Camera with ip \"{cam}\" output given")
+                
             except requests.Timeout:
                 await update.message.reply_text("Camera request timed out.")
+            except telegram.error.TimedOut:
+                await update.message.reply_text("Telegram request timed out.")
             except requests.RequestException as e:
                 await update.message.reply_text(f"[!] Camera error: {e}")
             except requests.exceptions.ConnectionError as conn_e:
@@ -240,66 +442,112 @@ async def help_command(update: Update, context: CallbackContext):
     await update.message.reply_text("Commands:\n/force_start\n/emergency_stop\n/stats - See sensors stats\n/help - to show this help lines.")
 
 async def start_bot(config: Config):
-    application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("help", help_command, block=False))
     application.add_handler(CommandHandler("cam", lambda a,b: send_picture_from_cam(config,a,b), block=False))
     application.add_handler(CommandHandler("force_start", lambda a,b: force_start(config,a,b), block=False))
     application.add_handler(CommandHandler("emergency_stop", lambda a,b: emergency_stop(config,a,b),block=False) )
     application.add_handler(CommandHandler("stats", lambda a,b: stats(config,a,b), block=False))
-    await application.run_polling(poll_interval=0.1337,allowed_updates=Update.MESSAGE, drop_pending_updates=True)
+    await application.run_polling(allowed_updates=Update.MESSAGE)
 
-
-
-async def start_routine(config:Config):
-        for group in config.groups:
-            for sensor in group.sensors:
-                    lcd = CharLCD(i2c_expander=os.getenv("I2C_EXPANDER"), address=0x27, port=1, cols=16, rows=4, dotsize=10) #LCD initalization 
-                    await sensor_and_display_monitoring(lcd,sensor)
-                    if await sensor_controller("temperature",sensor)==True: #Temperature too high
-                        for fan in group.fans:
-                            try:
-                                await switch(fan,"on")
-                            except:
-                                print(f"Error on turning off ip: {fan}",flush=True)
-                        for light in group.lights:
-                            try:    
-                                await switch(light,"off") #Let the environment cool down a bit
-
-                            except:
-                                print(f"Error on turning off ip: {light}",flush=True)
-                    if await sensor_controller("humidity",sensor)==True: #Humidity too high
-                        for fan in group.fans:
-                            try:
-                                await switch(fan,"on")
-                            except:
-                                print(f"Error on turning on ip: {fan}",flush=True)
-                        for light in group.lights:
-                            try:    
-                                await switch(light,"off") # Let the environment cool down a bit
-                            except:
-                                print(f"Error on turning off ip: {light}",flush=True)
-                        for water_pump in group.water_pumps:
-                            try:
-                                await switch(water_pump,"off") #Maybe the water pump mulfunctioned and all the water sinked inside the greenhouse, making the humidity raise
-                            except:
-                                print(f"Error on turning off ip: {water_pump}",flush=True)
-            for fan in group.fans:
+            
+                        
+async  def start_routine(config:Config):
+    for group in config.groups:
+        if datetime.now(timezone) <= seedling_end_time:
+            for water_pump in group.water_pumps:
                 try:
-                    await switch(fan,"off")
+                    await switch(water_pump,"on")
+                    await asyncio.sleep(120)
+                    await switch(water_pump,"off")
+                    await asyncio.sleep(1800)
                 except:
-                    print(f"Error on turning off ip: {fan}",flush=True)
+                    print(f"Error on turning on ip: {water_pump}",flush=True)
+        elif datetime.now(timezone) <= vegetative_end_time:
+            for water_pump in group.water_pumps:
+                try:
+                    await switch(water_pump,"on")
+                    await asyncio.sleep(240)
+                    await switch(water_pump,"off")
+                    await asyncio.sleep(1800)
 
-async def periodic(interval, coro, *args, **kwargs):
+                except:
+                    print(f"Error on turning on ip: {water_pump}",flush=True)
+        else:
+            for water_pump in group.water_pumps:
+                try:
+                    await switch(water_pump,"on")
+                    await asyncio.sleep(120)
+                    await switch(water_pump,"off")
+                    await asyncio.sleep(1800)
+
+                except:
+                    print(f"Error on turning on ip: {water_pump}",flush=True)
+        for sensor in group.sensors:
+            lcd = CharLCD(i2c_expander=os.getenv("I2C_EXPANDER"), address=0x27, port=1, cols=16, rows=4, dotsize=10) #LCD initalization 
+            await sensor_and_display_monitoring(lcd,sensor)
+            if await sensor_controller("temperature",sensor)==True: #Temperature too high
+                    for fan in group.fans:
+                        try:
+                            await switch(fan,"on")
+                            await asyncio.sleep(13.37)
+                        except:
+                            print(f"Error on turning off ip: {fan}",flush=True)
+            if await sensor_controller("humidity",sensor)==True: #Humidity too high
+                for fan in group.fans:
+                    try:
+                        await switch(fan,"on")
+                        await asyncio.sleep(13.37)
+                    except:
+                        print(f"Error on turning on ip: {fan}",flush=True)
+                for water_pump in group.water_pumps:
+                    try:
+                        await switch(water_pump,"off") #Maybe the water pump mulfunctioned and all the water sinked inside the greenhouse, making the humidity raise
+                        await asyncio.sleep(13.37)
+                    except:
+                        print(f"Error on turning off ip: {water_pump}",flush=True)
+            else:
+                for fan in group.fans:
+                    try:
+                        await switch(fan,"on")
+                        await asyncio.sleep(13.37)
+
+                    except:
+                        print(f"Error on turning on ip: {fan}",flush=True)
+                        
+async def light_routine(config):
+    for group in config.groups:
+        for light in group.lights:
+            if is_summer() and is_night():
+                print("turning off lights for fun an profit", flush=True)
+                await switch(light,mode="off")
+            else:
+                await switch(light,mode="on")
+async def periodic(interval,coro, *args, **kwargs):
     while True:
+        await coro(*args, **kwargs)
+        await asyncio.sleep(interval)
+async def run_forever(coro, *args, **kwargs):
+    while True:
+        await coro(*args, **kwargs)
+async def run_with_delay(interval,coro, *args, **kwargs):
         await asyncio.sleep(interval)
         await coro(*args, **kwargs)
+        
+
+        
 async def main():
     nest_asyncio.apply()
-    with open("config.json", "r") as f:
-        config: Config = json.loads(f.read(), object_hook=lambda d: SimpleNamespace(**d))
-    asyncio.create_task(periodic(1.337,start_routine,config))
+    asyncio.create_task(run_forever(start_routine,config)) # About every 30 minutes
+    asyncio.create_task(whoami(context))
+    asyncio.create_task(run_forever(light_routine, config))
     await start_bot(config)
+    
 
+        
                 
 if __name__ == "__main__":
+    init_ap()
+    init_db()
+    asyncio.run(asyncio.sleep(1.337))
+    #asyncio.run(run_with_delay(10,write_patched_config))
     asyncio.run(main())    
